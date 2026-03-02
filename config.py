@@ -1,55 +1,40 @@
 import MetaTrader5 as mt5
 
-PROJECT_NAME = "Babata_MT5_Bot_v2_Pyramid"
-MAGIC_NUMBER = 20260226
+# --- Babata V5.0 Ultimate Configuration (暴利进化版) ---
+PROJECT_NAME = "Babata_V5_Ultimate"
+MAGIC_SCALP = 1001
+MAGIC_SWING = 2001
+MAGIC_NUMBER = 20260505
 
-SYMBOLS = ["XAUUSD.s", "XAGUSD.s"]
+# 交易品种 (EBC后缀)
+SYMBOLS = ["XAUUSD.s", "XAGUSD.s", "USDIDX"]
 
-# Timeframe for validation: M30
-TIMEFRAME = mt5.TIMEFRAME_M30
+# Telegram 机器人配置 (已注入)
+TG_TOKEN = "7646402171:AAHnO_8NTRI9fWJL1RQTwGOwz_bM0A07uDs"
+TG_CHAT_ID = "6685908307"
 
-# Execution mode
+# --- 核心风控与资金管理 ---
+# 1. 激进复利模式
+# 计算公式: Lot = (Balance / 1000) * LOT_PER_1000
+# 例如: $1000 -> 0.05手, $5000 -> 0.25手
+ENABLE_COMPOUNDING = True
+LOT_PER_1000 = 0.05 
+MAX_LOT_SIZE = 5.0  # 单笔上限，防止流动性不足
+
+# 2. 动态 ATR 止损 (替代固定点数)
+ATR_PERIOD = 14
+ATR_MULTIPLIER_SL = 2.0  # 止损 = 2倍 ATR
+ATR_MULTIPLIER_TP = 4.0  # 止盈 = 4倍 ATR (盈亏比 1:2)
+
+# 3. 每日硬性风控
+MAX_DAILY_DD_PCT = 0.05 # 5% 强制止损
+DAILY_FLAT_HHMM = "23:55"
+LOCAL_TZ = "Asia/Phnom_Penh"
+
+# 执行设置
 FILLING_MODE = mt5.ORDER_FILLING_FOK
 DEVIATION = 30
-
-# ---- Validation risk caps (per symbol) ----
-# Max total volume per symbol during validation
-MAX_VOLUME_PER_SYMBOL = 0.03
-VOLUME_STEP = 0.01
-MIN_VOLUME = 0.01
-
-# Split ratio 50/30/20
-ENTRY_WEIGHTS = (0.50, 0.30, 0.20)
-
-# Daily max drawdown
-MAX_DAILY_DD_PCT = 0.02
-
-# SL/TP points baseline (used to define R)
-SL_POINTS = 500
-TP1_R = 1.0
-TP2_R = 2.0
-
-# Pyramid spacing: X = 0.6 * ATR(14)
-ATR_PERIOD = 14
-PYRAMID_ATR_MULT = 0.6
-
-# Strategy parameters
-RSI_PERIOD = 14
-RSI_LOWER = 30
-RSI_UPPER = 70
-BB_PERIOD = 20
-BB_DEV = 2.0
-BAND_BUFFER_POINTS = 0
-
-# Runner trailing stop uses last closed candle low/high
-
-# Polling
 POLL_SECONDS = 10
 
-# Daily flat (no overnight)
-LOCAL_TZ = "Asia/Phnom_Penh"  # GMT+7
-DAILY_FLAT_HHMM = "23:55"
-NO_TRADE_MINUTES_AFTER_FLAT = 10
-
-LOG_PATH = r"C:\TradingBot\bot.log"
-ERROR_LOG_PATH = r"C:\TradingBot\bot.err.log"
+# 路径 (保持 V3 结构)
+LOG_PATH = r"C:\TradingBot_v3\smc_v3_core\bot.log"

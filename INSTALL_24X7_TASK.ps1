@@ -1,13 +1,8 @@
-# Babata MT5 Bot v2 - Scheduled Task installer
-# Run PowerShell as Administrator:
-#   cd C:\TradingBot
-#   powershell -ExecutionPolicy Bypass -File .\INSTALL_24X7_TASK.ps1
-
-$TaskName = "BabataMT5Bot"
-$BotDir = "C:\TradingBot"
+$TaskName = "BabataV5Bot"
+$BotDir = "C:\TradingBot_v3\smc_v3_core"
 $User = "$env:USERDOMAIN\$env:USERNAME"
 
-$Action   = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c C:\TradingBot\START_BOT.cmd" -WorkingDirectory $BotDir
+$Action   = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c C:\TradingBot_v3\smc_v3_core\START_BOT.cmd" -WorkingDirectory $BotDir
 $Trigger  = New-ScheduledTaskTrigger -AtLogOn
 $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 

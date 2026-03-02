@@ -2,449 +2,181 @@ import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
 import time
-import sys
-import os
 import traceback
+import requests
 from datetime import datetime
 import pytz
-
 import config
 
-
-def now_utc():
-    return datetime.now(tz=pytz.UTC).strftime("%Y-%m-%d %H:%M:%S%z")
-
+# --- 基础工具 ---
+def now_local_dt():
+    try:
+        tz = pytz.timezone(config.LOCAL_TZ)
+        return datetime.now(tz=tz)
+    except: return datetime.now()
 
 def log(msg: str):
-    line = f"[{now_utc()}] {msg}"
-    print(line, flush=True)
+    print(f"[{now_local_dt().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-
-def log_err(msg: str):
-    line = f"[{now_utc()}] {msg}"
+# --- 📡 Telegram 推送模块 ---
+def send_tg(message):
     try:
-        with open(config.ERROR_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-    print(line, flush=True)
+        url = f"https://api.telegram.org/bot{config.TG_TOKEN}/sendMessage"
+        data = {"chat_id": config.TG_CHAT_ID, "text": message}
+        # 设置 5 秒超时，防止卡死主线程
+        requests.post(url, data=data, timeout=5)
+    except Exception as e:
+        log(f"⚠️ TG 推送失败: {e}")
 
+# --- 🧬 动态计算引擎 ---
+def get_atr(symbol, timeframe, period=14):
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, period + 5)
+    if rates is None or len(rates) < period: return 0.0
+    df = pd.DataFrame(rates)
+    df['h-l'] = df['high'] - df['low']
+    df['h-pc'] = abs(df['high'] - df['close'].shift(1))
+    df['l-pc'] = abs(df['low'] - df['close'].shift(1))
+    df['tr'] = df[['h-l', 'h-pc', 'l-pc']].max(axis=1)
+    return df['tr'].rolling(period).mean().iloc[-1]
 
-def round_volume(v: float) -> float:
-    step = config.VOLUME_STEP
-    v = max(config.MIN_VOLUME, v)
-    return round(round(v / step) * step, 2)
+def calc_lot_size(symbol):
+    """ 激进复利核心: 余额每增加 $1000，手数增加 0.05 """
+    if not config.ENABLE_COMPOUNDING: return 0.01
+    
+    acc = mt5.account_info()
+    if not acc: return 0.01
+    
+    balance = acc.balance
+    lot = (balance / 1000.0) * config.LOT_PER_1000
+    lot = round(lot, 2)
+    
+    # 限制极值
+    lot = max(0.01, min(lot, config.MAX_LOT_SIZE))
+    return lot
 
+def refine_stops_atr(symbol, order_type, entry_price, timeframe):
+    """ 使用 ATR 计算动态止损，并解决 Invalid stops 问题 """
+    atr = get_atr(symbol, timeframe, config.ATR_PERIOD)
+    if atr == 0: atr = 0.002 # 兜底默认值
+    
+    dist_sl = atr * config.ATR_MULTIPLIER_SL
+    dist_tp = atr * config.ATR_MULTIPLIER_TP
+    
+    # 获取券商最小限制
+    info = mt5.symbol_info(symbol)
+    if not info: return 0, 0
+    p = info.point
+    min_dist_broker = max(info.trade_stops_level or 0, info.trade_freeze_level or 0) * p * 1.5
+    
+    # 确保 ATR 距离大于券商限制
+    final_dist_sl = max(dist_sl, min_dist_broker)
+    final_dist_tp = max(dist_tp, min_dist_broker)
+    
+    sl, tp = 0.0, 0.0
+    if order_type == 0: # BUY
+        sl = entry_price - final_dist_sl
+        tp = entry_price + final_dist_tp
+    else: # SELL
+        sl = entry_price + final_dist_sl
+        tp = entry_price - final_dist_tp
+        
+    return round(sl, info.digits), round(tp, info.digits)
 
-def weights_to_volumes(max_total: float):
-    w = config.ENTRY_WEIGHTS
-    vols = [round_volume(max_total * w[0]), round_volume(max_total * w[1]), round_volume(max_total * w[2])]
-    # adjust to not exceed max_total due to rounding
-    while sum(vols) > max_total + 1e-9:
-        # reduce the last leg first
-        if vols[2] > config.MIN_VOLUME:
-            vols[2] = round_volume(vols[2] - config.VOLUME_STEP)
-        elif vols[1] > config.MIN_VOLUME:
-            vols[1] = round_volume(vols[1] - config.VOLUME_STEP)
-        else:
-            vols[0] = round_volume(vols[0] - config.VOLUME_STEP)
-    return vols
+# --- SMC 策略引擎 ---
+class SMCAnalyzer:
+    def __init__(self, s, tf):
+        self.s, self.tf = s, tf
+        r = mt5.copy_rates_from_pos(s, tf, 0, 500)
+        self.df = pd.DataFrame(r) if r is not None else None
+        if self.df is not None: self.df['ema'] = self.df['close'].ewm(span=200).mean()
+    def get_trend(self):
+        if self.df is None: return 0
+        return 1 if self.df['close'].iloc[-1] > self.df['ema'].iloc[-1] else -1
+    def detect_fvg(self):
+        if self.df is None or len(self.df) < 5: return 0
+        h, l = self.df['high'], self.df['low']
+        return 1 if h.iloc[-3] < l.iloc[-1] else (-1 if l.iloc[-3] > h.iloc[-1] else 0)
+    def detect_choch(self):
+        if self.df is None or len(self.df) < 22: return 0
+        h, l, c = self.df['high'].iloc[-20:-1].max(), self.df['low'].iloc[-20:-1].min(), self.df['close'].iloc[-1]
+        return 1 if c > h else (-1 if c < l else 0)
 
-
-def ema(series: pd.Series, period: int):
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def atr(df: pd.DataFrame, period: int):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def calculate_rsi(close: pd.Series, period: int):
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_bbands(close: pd.Series, period: int, std_dev: float):
-    mid = close.rolling(period).mean()
-    std = close.rolling(period).std()
-    upper = mid + std_dev * std
-    lower = mid - std_dev * std
-    return upper, lower
-
-
-def now_local_dt():
-    tz = pytz.timezone(config.LOCAL_TZ)
-    return datetime.now(tz=tz)
-
-
-def in_flat_window():
-    dt = now_local_dt()
-    flat_h, flat_m = map(int, config.DAILY_FLAT_HHMM.split(':'))
-    flat_dt = dt.replace(hour=flat_h, minute=flat_m, second=0, microsecond=0)
-    delta_min = (dt - flat_dt).total_seconds() / 60.0
-    return 0 <= delta_min < config.NO_TRADE_MINUTES_AFTER_FLAT
-
-
-class BabataTrader:
+# --- 交易主程序 ---
+class BabataBot:
     def __init__(self):
-        self.equity_start_of_day = None
-        self.last_closed_bar_time = {}
-        self.entry_plan = weights_to_volumes(config.MAX_VOLUME_PER_SYMBOL)
-        self.last_entry_price = {}  # symbol -> last add price
-
+        self.equity_start = None
+        self.last_heartbeat = 0
+    
     def connect(self):
-        if not mt5.initialize():
-            raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
-        acc = mt5.account_info()
-        if acc is None:
-            raise RuntimeError("account_info() is None")
-        self.equity_start_of_day = float(acc.equity)
-        log(f"[INFO] Connected login={acc.login} balance={acc.balance} equity={acc.equity}")
+        if not mt5.initialize(): quit()
+        self.equity_start = mt5.account_info().equity
+        msg = f"🚀 **Babata V5.0 [暴利进化版]** 启动成功!\n账号: `{mt5.account_info().login}`\n余额: `${mt5.account_info().balance}`\n模式: 激进复利 + ATR风控 + TG推送"
+        log("上线成功"); send_tg(msg)
 
-        for s in config.SYMBOLS:
-            info = mt5.symbol_info(s)
-            if info is None:
-                raise RuntimeError(f"symbol_info({s}) is None")
-            if not info.visible:
-                mt5.symbol_select(s, True)
-
-        log(f"[PLAN] entry volumes per symbol={self.entry_plan} max_total={config.MAX_VOLUME_PER_SYMBOL}")
-
-    def check_daily_dd(self):
-        acc = mt5.account_info()
-        if acc is None or self.equity_start_of_day is None:
-            return True
-        dd = (self.equity_start_of_day - float(acc.equity)) / self.equity_start_of_day
-        if dd >= config.MAX_DAILY_DD_PCT:
-            log_err(f"[ALERT] Daily DD hit {dd*100:.2f}% >= {config.MAX_DAILY_DD_PCT*100:.2f}%. Flat & stop.")
-            self.close_all_positions()
-            return False
-        return True
-
-    def close_all_positions(self):
-        positions = mt5.positions_get()
-        if not positions:
-            return
-        for pos in positions:
-            tick = mt5.symbol_info_tick(pos.symbol)
-            if tick is None:
-                continue
-            close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-            price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-            req = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "position": pos.ticket,
-                "symbol": pos.symbol,
-                "volume": pos.volume,
-                "type": close_type,
-                "price": price,
-                "deviation": config.DEVIATION,
-                "magic": config.MAGIC_NUMBER,
-                "comment": "Babata Flat",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": config.FILLING_MODE,
-            }
-            mt5.order_send(req)
-
-    def get_positions(self, symbol: str):
-        pos = mt5.positions_get(symbol=symbol)
-        return list(pos) if pos else []
-
-    def total_volume(self, symbol: str):
-        return sum(p.volume for p in self.get_positions(symbol))
-
-    def get_data(self, symbol: str):
-        rates = mt5.copy_rates_from_pos(symbol, config.TIMEFRAME, 0, 300)
-        if rates is None:
-            return None
-        df = pd.DataFrame(rates)
-        if df.empty:
-            return None
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        df["RSI"] = calculate_rsi(df["close"], config.RSI_PERIOD)
-        df["BBU"], df["BBL"] = calculate_bbands(df["close"], config.BB_PERIOD, config.BB_DEV)
-        df["ATR"] = atr(df, config.ATR_PERIOD)
-        return df
-
-    def send_order(self, symbol: str, order_type, volume: float, sl: float, tp: float, comment: str):
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            return None
-        price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+    def trade(self, s, t, magic, comment, tf_atr):
+        # 1. 检查持仓
+        if len(mt5.positions_get(symbol=s, magic=magic) or []) > 0: return
+        
+        # 2. 获取价格
+        tk = mt5.symbol_info_tick(s)
+        if not tk: return
+        entry = tk.ask if t == 0 else tk.bid
+        
+        # 3. 计算复利手数
+        lot = calc_lot_size(s)
+        
+        # 4. 计算动态 ATR 止损
+        sl, tp = refine_stops_atr(s, t, entry, tf_atr)
+        
+        # 5. 下单
         req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": volume,
-            "type": order_type,
-            "price": price,
-            "sl": sl,
-            "tp": tp,
-            "deviation": config.DEVIATION,
-            "magic": config.MAGIC_NUMBER,
-            "comment": comment,
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": config.FILLING_MODE,
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": s, "volume": lot,
+            "type": t, "price": entry, "sl": sl, "tp": tp,
+            "magic": magic, "comment": comment, "type_filling": config.FILLING_MODE
         }
-        return mt5.order_send(req)
-
-    def close_position(self, pos):
-        tick = mt5.symbol_info_tick(pos.symbol)
-        if tick is None:
-            return
-        close_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        price = tick.bid if pos.type == mt5.ORDER_TYPE_BUY else tick.ask
-        req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "position": pos.ticket,
-            "symbol": pos.symbol,
-            "volume": pos.volume,
-            "type": close_type,
-            "price": price,
-            "deviation": config.DEVIATION,
-            "magic": config.MAGIC_NUMBER,
-            "comment": "Babata TP",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": config.FILLING_MODE,
-        }
-        mt5.order_send(req)
-
-    def apply_trade_management(self, symbol: str, df: pd.DataFrame):
-        """Handle TP1/TP2 and runner trailing using last closed candle."""
-        positions = self.get_positions(symbol)
-        if not positions:
-            return
-
-        info = mt5.symbol_info(symbol)
-        if info is None:
-            return
-        point = info.point
-        R = config.SL_POINTS * point
-
-        last_closed = df.iloc[-2]
-        trail_low = float(last_closed["low"])
-        trail_high = float(last_closed["high"])
-
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            return
-        current = tick.bid  # use bid as conservative mark
-
-        # Determine direction by first position
-        direction = positions[0].type  # 0 buy, 1 sell
-        # Average entry price
-        avg_entry = sum(p.price_open * p.volume for p in positions) / sum(p.volume for p in positions)
-
-        # profit in price units
-        pnl = (current - avg_entry) if direction == mt5.ORDER_TYPE_BUY else (avg_entry - current)
-
-        # TP1: >= 1R
-        if pnl >= config.TP1_R * R and len(positions) >= 1:
-            # close smallest ticket (or first) as TP1
-            p = sorted(positions, key=lambda x: x.volume)[0]
-            log(f"[TP1] closing 1st leg ticket={p.ticket} vol={p.volume}")
-            self.close_position(p)
-
-            # move remaining SL to breakeven for all positions
-            remaining = self.get_positions(symbol)
-            for rp in remaining:
-                new_sl = avg_entry
-                # update SL
-                req = {
-                    "action": mt5.TRADE_ACTION_SLTP,
-                    "position": rp.ticket,
-                    "sl": new_sl,
-                    "tp": rp.tp,
-                    "magic": config.MAGIC_NUMBER,
-                    "comment": "Babata BE",
-                }
-                mt5.order_send(req)
-
-        # TP2: >= 2R (close another leg if >1 position left)
-        positions2 = self.get_positions(symbol)
-        if pnl >= config.TP2_R * R and len(positions2) >= 2:
-            p = sorted(positions2, key=lambda x: x.volume)[0]
-            log(f"[TP2] closing 2nd leg ticket={p.ticket} vol={p.volume}")
-            self.close_position(p)
-
-        # Runner trailing: for last remaining position, trail SL to last closed candle low/high
-        remaining = self.get_positions(symbol)
-        if len(remaining) == 1:
-            rp = remaining[0]
-            if direction == mt5.ORDER_TYPE_BUY:
-                new_sl = trail_low
-                if rp.sl is None or rp.sl < new_sl:
-                    req = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": rp.ticket,
-                        "sl": new_sl,
-                        "tp": rp.tp,
-                        "magic": config.MAGIC_NUMBER,
-                        "comment": "Babata Trail",
-                    }
-                    mt5.order_send(req)
-            else:
-                new_sl = trail_high
-                if rp.sl is None or rp.sl > new_sl:
-                    req = {
-                        "action": mt5.TRADE_ACTION_SLTP,
-                        "position": rp.ticket,
-                        "sl": new_sl,
-                        "tp": rp.tp,
-                        "magic": config.MAGIC_NUMBER,
-                        "comment": "Babata Trail",
-                    }
-                    mt5.order_send(req)
-
-    def maybe_enter_or_add(self, symbol: str, df: pd.DataFrame):
-        info = mt5.symbol_info(symbol)
-        tick = mt5.symbol_info_tick(symbol)
-        if info is None or tick is None:
-            return
-        point = info.point
-
-        last = df.iloc[-2]  # closed bar
-        rsi = float(last["RSI"])
-        close = float(last["close"])
-        bbu = float(last["BBU"])
-        bbl = float(last["BBL"])
-        atr_val = float(last["ATR"]) if not pd.isna(last["ATR"]) else None
-        if atr_val is None:
-            return
-
-        buf = config.BAND_BUFFER_POINTS * point
-
-        base_signal = None
-        if rsi < config.RSI_LOWER and close <= (bbl + buf):
-            base_signal = "BUY"
-        elif rsi > config.RSI_UPPER and close >= (bbu - buf):
-            base_signal = "SELL"
-
-        # manage entries
-        positions = self.get_positions(symbol)
-        total_vol = sum(p.volume for p in positions) if positions else 0.0
-
-        # Determine next planned volume based on how many legs already open
-        legs_open = len(positions)
-        if legs_open >= 3:
-            return
-
-        # If no position: require base signal
-        if legs_open == 0:
-            if not base_signal:
-                log(f"[CHECK] {symbol} time={last['time']} no-signal rsi={rsi:.2f}")
-                return
-
-            # place leg1
-            vol = self.entry_plan[0]
-            sl = (tick.ask - config.SL_POINTS * point) if base_signal == "BUY" else (tick.bid + config.SL_POINTS * point)
-            tp = (tick.ask + config.TP1_R * config.SL_POINTS * point) if base_signal == "BUY" else (tick.bid - config.TP1_R * config.SL_POINTS * point)
-            order_type = mt5.ORDER_TYPE_BUY if base_signal == "BUY" else mt5.ORDER_TYPE_SELL
-            res = self.send_order(symbol, order_type, vol, sl, tp, "Babata L1")
-            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-                self.last_entry_price[symbol] = res.price
-                log(f"[OK] ENTER L1 {base_signal} {symbol} vol={vol} price={res.price}")
-            else:
-                log_err(f"[ERROR] ENTER L1 failed {symbol} ret={getattr(res,'retcode',None)} comment={getattr(res,'comment',None)}")
-            return
-
-        # If have positions: only add if in profit by X = 0.6*ATR from last_entry_price
-        direction = positions[0].type
-        last_price = self.last_entry_price.get(symbol, positions[-1].price_open)
-        X = config.PYRAMID_ATR_MULT * atr_val
-
-        if direction == mt5.ORDER_TYPE_BUY:
-            current = tick.bid
-            if current < last_price + X:
-                return
-            add_type = mt5.ORDER_TYPE_BUY
-            sl = current - config.SL_POINTS * point
-            tp = current + config.TP2_R * config.SL_POINTS * point
+        res = mt5.order_send(req)
+        
+        if res.retcode == 10009:
+            emoji = "🟢 多单" if t == 0 else "🔴 空单"
+            msg = f"{emoji} **开仓成功**\n品种: {s}\n手数: {lot}\n价格: {entry}\nSL: {sl}\nTP: {tp}\n策略: {comment}"
+            log(f"开仓: {s} {lot}手"); send_tg(msg)
         else:
-            current = tick.ask
-            if current > last_price - X:
-                return
-            add_type = mt5.ORDER_TYPE_SELL
-            sl = current + config.SL_POINTS * point
-            tp = current - config.TP2_R * config.SL_POINTS * point
-
-        # respect volume cap
-        next_vol = self.entry_plan[legs_open]
-        if total_vol + next_vol > config.MAX_VOLUME_PER_SYMBOL + 1e-9:
-            return
-
-        res = self.send_order(symbol, add_type, next_vol, sl, tp, f"Babata L{legs_open+1}")
-        if res and res.retcode == mt5.TRADE_RETCODE_DONE:
-            self.last_entry_price[symbol] = res.price
-            log(f"[OK] ADD L{legs_open+1} {symbol} vol={next_vol} price={res.price} X={X:.5f}")
-        else:
-            log_err(f"[ERROR] ADD L{legs_open+1} failed {symbol} ret={getattr(res,'retcode',None)} comment={getattr(res,'comment',None)}")
+            log(f"❌ 下单失败: {res.comment}")
 
     def run(self):
         self.connect()
-        log(f"[SYSTEM] Started v2 TF=M30 fill=FOK maxVol/sym={config.MAX_VOLUME_PER_SYMBOL} weights={config.ENTRY_WEIGHTS} ATRmult={config.PYRAMID_ATR_MULT} DD={config.MAX_DAILY_DD_PCT*100:.1f}%")
-
         while True:
-            if in_flat_window():
-                log(f"[FLAT] {config.LOCAL_TZ} {config.DAILY_FLAT_HHMM} closing all positions and blocking entries")
-                self.close_all_positions()
-                time.sleep(30)
-                continue
+            # 风控
+            if (self.equity_start - mt5.account_info().equity) / self.equity_start >= config.MAX_DAILY_DD_PCT:
+                send_tg("🛑 **触发 5% 强制风控，停止交易**"); time.sleep(3600); continue
+            
+            # 扫描
+            for s in config.SYMBOLS:
+                if not mt5.symbol_select(s, 1): continue
+                
+                # 策略 A: 刺客 (M15+M1) -> 用 M1 的 ATR 止损 (紧)
+                a15, a1 = SMCAnalyzer(s, 15), SMCAnalyzer(s, 1)
+                if a15.get_trend() == 1 and a1.detect_choch() == 1:
+                    self.trade(s, 0, config.MAGIC_SCALP, "Scalp_V5", 1)
+                elif a15.get_trend() == -1 and a1.detect_choch() == -1:
+                    self.trade(s, 1, config.MAGIC_SCALP, "Scalp_V5", 1)
+                
+                # 策略 B: 猎手 (H4+M15) -> 用 M15 的 ATR 止损 (宽)
+                ah4, am15 = SMCAnalyzer(s, 16388), SMCAnalyzer(s, 15)
+                if ah4.get_trend() == 1 and am15.detect_fvg() == 1:
+                    self.trade(s, 0, config.MAGIC_SWING, "Swing_V5", 15)
+                elif ah4.get_trend() == -1 and am15.detect_fvg() == -1:
+                    self.trade(s, 1, config.MAGIC_SWING, "Swing_V5", 15)
 
-            if not self.check_daily_dd():
-                time.sleep(60)
-                continue
-
-            for symbol in config.SYMBOLS:
-                rates3 = mt5.copy_rates_from_pos(symbol, config.TIMEFRAME, 0, 3)
-                if rates3 is None or len(rates3) < 3:
-                    continue
-                closed_bar_time = int(rates3[-2]["time"])
-                if self.last_closed_bar_time.get(symbol) == closed_bar_time:
-                    continue
-                self.last_closed_bar_time[symbol] = closed_bar_time
-
-                df = self.get_data(symbol)
-                if df is None:
-                    continue
-
-                # 1) Manage existing positions
-                self.apply_trade_management(symbol, df)
-                # 2) Enter or pyramid-add
-                self.maybe_enter_or_add(symbol, df)
-
-            time.sleep(config.POLL_SECONDS)
-
-
-def main():
-    try:
-        os.makedirs(os.path.dirname(config.LOG_PATH), exist_ok=True)
-        BabataTrader().run()
-    except KeyboardInterrupt:
-        log("[SYSTEM] Stopped by user")
-    except Exception as e:
-        log_err(f"[FATAL] {e}")
-        log_err(traceback.format_exc())
-        raise
-    finally:
-        try:
-            mt5.shutdown()
-        except Exception:
-            pass
-
+            # 心跳 (每分钟)
+            if time.time() - self.last_heartbeat > 60:
+                print(f"[{datetime.now().strftime('%H:%M')}] 📡 V5.0 正在扫描... 复利倍数: {config.LOT_PER_1000}/$1k", flush=True)
+                self.last_heartbeat = time.time()
+            
+            time.sleep(10)
 
 if __name__ == "__main__":
-    main()
+    try: BabataBot().run()
+    except Exception as e:
+        err = f"💀 **程序崩溃**: {e}\n{traceback.format_exc()}"
+        print(err); send_tg(err)
