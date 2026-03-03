@@ -9,15 +9,14 @@ class NakedKStrategy(BaseStrategy):
         last = self.df.iloc[-2]
         prev = self.df.iloc[-3]
         
-        # 1. Engulfing (吞没)
+        # Engulfing
         is_bull_engulf = last['close'] > prev['high'] and last['open'] < prev['low']
         is_bear_engulf = last['close'] < prev['low'] and last['open'] > prev['high']
         
-        # 2. Pinbar (拒绝)
+        # Pinbar
         body = abs(last['close'] - last['open'])
         range_k = last['high'] - last['low']
         if range_k == 0: return 0
-        
         upper_wick = last['high'] - max(last['close'], last['open'])
         lower_wick = min(last['close'], last['open']) - last['low']
         
