@@ -354,7 +354,7 @@ def main():
                 log(f"⚡ Silver Bullet Window: {sb_window}")
                 for symbol in PRIMARY_PAIRS:  # 超短线只做黄金+白银
                     try:
-                        placed = run_silver_bullet(symbol, sb_window, daily_scalp_count)
+                        placed = run_silver_bullet(symbol, sb_window, daily_scalp_count, daily_start_balance)
                         if placed:
                             daily_scalp_count += 1
                     except Exception as e:

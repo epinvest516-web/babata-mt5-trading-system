@@ -73,6 +73,14 @@ HIGH_CONFIDENCE      = 0.80      # High conf → heavier position
 USE_LIMIT_ORDER      = True      # Limit order at OTE (precision)
 
 # ============================================================
+# SILVER BULLET SCALP SETTINGS
+# ============================================================
+SB_RISK_PCT        = 1.0    # 1% risk per scalp trade
+SB_MIN_RR          = 1.5    # Minimum RR for scalp entry
+SB_MAX_DAILY       = 6      # Max scalp trades per day
+SB_DAILY_TARGET    = 500.0  # 日盈利目标 $500 → 达到后暂停超短线
+
+# ============================================================
 # TRAILING STOP
 # ============================================================
 TRAIL_ENABLED        = True

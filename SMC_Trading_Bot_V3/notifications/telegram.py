@@ -114,6 +114,18 @@ def alert_daily_report(balance, equity, daily_pnl, total_trades, win_trades):
     )
 
 
+def alert_scalp_target_reached(daily_pnl, target):
+    _send(
+        f"🎯 <b>【超短线目标达成！】</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 今日超短线盈利: <b>${daily_pnl:,.2f}</b>\n"
+        f"🎯 目标: ${target:,.2f}\n"
+        f"✅ 超短线已自动暂停，波段继续运行\n"
+        f"🔄 明日 UTC 00:00 自动重置\n"
+        f"⏰ {ts()}"
+    )
+
+
 def alert_signal_skipped(symbol, reason, confidence):
     _send(
         f"⏭️ <b>【信号跳过】</b>\n"

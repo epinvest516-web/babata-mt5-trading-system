@@ -9,7 +9,7 @@ import pandas as pd
 from datetime import datetime, timezone
 from engine.smc_core import SMCCore
 from risk.position_sizing import already_in_trade, total_open_trades
-from notifications.telegram import _send
+from notifications.telegram import _send, alert_scalp_target_reached
 from journal.logger import log, record_trade_open
 from config import *
 
@@ -23,10 +23,7 @@ SILVER_BULLET_WINDOWS = {
     "NY_Open_SB": (14, 0,  15, 0),   # 14:00 - 15:00 UTC
 }
 
-# Scalp-specific settings
-SB_RISK_PCT  = 1.0    # 1% risk per scalp
-SB_MIN_RR    = 1.5    # Minimum RR for scalp
-SB_MAX_DAILY = 4      # Max scalp trades per day
+# Scalp settings loaded from config.py
 
 
 def in_silver_bullet_window():
@@ -107,12 +104,28 @@ def send_scalp_alert(symbol, direction, entry, sl, tp, lots, rr, window):
     )
 
 
-def run_silver_bullet(symbol, window, daily_scalp_count):
+def get_daily_scalp_pnl(start_balance):
+    """计算今日超短线盈亏（用于日盈利目标检测）。"""
+    account = mt5.account_info()
+    if not account or not start_balance:
+        return 0.0
+    return account.equity - start_balance
+
+
+def run_silver_bullet(symbol, window, daily_scalp_count, daily_start_balance=None):
     """
     Main Silver Bullet execution logic.
     Returns True if trade was placed.
     """
-    # Daily scalp limit
+    # ── 日盈利目标检查 ──
+    if daily_start_balance:
+        daily_pnl = get_daily_scalp_pnl(daily_start_balance)
+        if daily_pnl >= SB_DAILY_TARGET:
+            log(f"⚡ [SB] 日盈利目标已达 ${daily_pnl:.2f} ≥ ${SB_DAILY_TARGET} → 超短线暂停")
+            alert_scalp_target_reached(daily_pnl, SB_DAILY_TARGET)
+            return False
+
+    # ── 日交易次数上限 ──
     if daily_scalp_count >= SB_MAX_DAILY:
         return False
 
