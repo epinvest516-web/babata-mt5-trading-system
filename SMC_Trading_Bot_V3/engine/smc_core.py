@@ -210,13 +210,21 @@ class SMCCore:
         curr_close = last['close']
         curr_open  = last['open']
 
-        # Bullish sweep: wick below prior lows + close rejection above LL
-        # (removed candle color requirement — just need rejection)
-        if curr_low < prev_ll and curr_close > prev_ll:
-            return 'bullish'
-        # Bearish sweep: wick above prior highs + close rejection below HH
-        if curr_high > prev_hh and curr_close < prev_hh:
-            return 'bearish'
+        body_size = abs(curr_close - curr_open)
+        candle_range = curr_high - curr_low if (curr_high - curr_low) > 0 else 1
+
+        # Bullish sweep: wick below prior lows, close above (relaxed: partial recovery ok)
+        bull_wick = prev_ll - curr_low
+        if curr_low < prev_ll and curr_close > curr_low and curr_close > curr_open:
+            recovery = (curr_close - curr_low) / (prev_ll - curr_low + 0.0001)
+            if recovery > 0.3:  # Recovered at least 30% of wick
+                return 'bullish'
+        # Bearish sweep: wick above prior highs, close below (relaxed: partial drop ok)
+        bear_wick = curr_high - prev_hh
+        if curr_high > prev_hh and curr_close < curr_high and curr_close < curr_open:
+            drop = (curr_high - curr_close) / (curr_high - prev_hh + 0.0001)
+            if drop > 0.3:  # Dropped at least 30% of excess
+                return 'bearish'
         return None
 
     # ─────────────────────────────────────────────────────────
@@ -281,14 +289,14 @@ class SMCCore:
             elif d_close < d_ma20 and d_close < d_prev:
                 scores['bearish'] += 3
 
-            # H4 bias (weight: 2)
+            # H4 bias (weight: 2) - exclusive assignment, no double-counting
             h4_ma20 = df_h4['close'].iloc[-20:].mean()
             h4_close = df_h4['close'].iloc[-1]
             h4_hh = df_h4['high'].iloc[-1] > df_h4['high'].iloc[-5:-1].max()
             h4_ll = df_h4['low'].iloc[-1] < df_h4['low'].iloc[-5:-1].min()
             if h4_close > h4_ma20 or h4_hh:
                 scores['bullish'] += 2
-            if h4_close < h4_ma20 or h4_ll:
+            elif h4_close < h4_ma20 or h4_ll:
                 scores['bearish'] += 2
 
             # H1 bias (weight: 1)
@@ -299,7 +307,7 @@ class SMCCore:
             else:
                 scores['bearish'] += 1
 
-            # Need at least 3/6 score to confirm bias (relaxed for more signals)
+            # Need at least 3/6 score to confirm bias (relaxed from 4)
             if scores['bullish'] >= 3 and scores['bullish'] > scores['bearish']:
                 return 'bullish'
             if scores['bearish'] >= 3 and scores['bearish'] > scores['bullish']:

@@ -56,15 +56,15 @@ COMPOUND_RISK_PCT    = 2.5       # Risk % in compound mode
 # ============================================================
 # SMC ENTRY LOGIC
 # ============================================================
-MIN_RR               = 2.5       # Minimum Risk:Reward ratio
+MIN_RR               = 2.0       # Minimum Risk:Reward ratio
 HIGH_CONF_RR         = 2.0       # Allow 1:2 when confidence >85%
 OTE_LOW              = 0.618     # OTE zone start (Fib)
 OTE_HIGH             = 0.786     # OTE zone end (Fib)
 SL_BUFFER_PCT        = 0.15      # SL buffer beyond swing
-SWEEP_LOOKBACK       = 40        # Bars to look back for liquidity
+SWEEP_LOOKBACK       = 60        # Bars to look back for liquidity
 
 # Confidence thresholds
-MIN_CONFIDENCE       = 0.60      # Min to enter trade
+MIN_CONFIDENCE       = 0.50      # Min to enter trade
 HIGH_CONFIDENCE      = 0.80      # High conf → heavier position
 
 # ============================================================
