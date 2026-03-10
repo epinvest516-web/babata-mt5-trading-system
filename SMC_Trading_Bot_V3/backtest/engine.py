@@ -1,6 +1,5 @@
 # ============================================================
-# SMC Phantom V3.0 - Backtest Engine
-# Supports: 1-month / 1-quarter simulation
+# SMC Phantom V3.1 - Backtest Engine (Fixed)
 # ============================================================
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -15,10 +14,11 @@ from config import *
 smc = SMCCore()
 
 
-def get_historical(symbol, timeframe, start_dt, end_dt, count=5000):
-    rates = mt5.copy_rates_range(symbol, timeframe,
-                                  start_dt.replace(tzinfo=None),
-                                  end_dt.replace(tzinfo=None))
+def get_hist(symbol, tf, days_back, count=5000):
+    """Fetch historical OHLCV data."""
+    end   = datetime.now()
+    start = end - timedelta(days=days_back)
+    rates = mt5.copy_rates_range(symbol, tf, start, end)
     if rates is None or len(rates) == 0:
         return None
     df = pd.DataFrame(rates)
@@ -28,159 +28,211 @@ def get_historical(symbol, timeframe, start_dt, end_dt, count=5000):
     return df
 
 
+def find_symbol(base):
+    """Find the correct symbol name (try multiple suffixes)."""
+    variants = [base, base + '.s', base.replace('.s', ''), base + 'm']
+    all_syms = [s.name for s in mt5.symbols_get()]
+    for v in variants:
+        if v in all_syms:
+            return v
+    # Partial match
+    for s in all_syms:
+        if base.replace('.s', '') in s:
+            return s
+    return None
+
+
 def simulate_lot(balance, entry, sl, risk_pct=2.0):
-    """Simple lot sim for backtest (no MT5 contract specs needed)."""
     risk_amt = balance * (risk_pct / 100)
     sl_dist  = abs(entry - sl)
     if sl_dist == 0:
         return 0.01
-    # Approximate: $1/pip for 0.01 lot on Gold
-    pip_value = 1.0
-    lots = risk_amt / (sl_dist * 100 * pip_value)
+    lots = risk_amt / (sl_dist * 100)
     return max(0.01, round(lots, 2))
 
 
-def run_backtest(symbol, period_days=30, risk_pct=2.0, min_rr=MIN_RR):
-    if not mt5.initialize():
-        print("MT5 init failed")
-        return None
-
-    end_dt   = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=period_days)
-
+def run_backtest(symbol_raw, period_days=30, risk_pct=2.0):
     print(f"\n{'='*60}")
-    print(f"SMC Phantom V3.0 — Backtest")
-    print(f"Symbol: {symbol} | Period: {period_days} days")
-    print(f"From: {start_dt.date()} To: {end_dt.date()}")
+    print(f"SMC Phantom V3.1 — Backtest")
+    print(f"Symbol: {symbol_raw} | Period: {period_days} days")
     print(f"{'='*60}")
 
-    # Load data
-    df_d   = get_historical(symbol, mt5.TIMEFRAME_D1,  start_dt - timedelta(days=100), end_dt)
-    df_h4  = get_historical(symbol, mt5.TIMEFRAME_H4,  start_dt - timedelta(days=50), end_dt)
-    df_h1  = get_historical(symbol, mt5.TIMEFRAME_H1,  start_dt - timedelta(days=30), end_dt)
-    df_m15 = get_historical(symbol, mt5.TIMEFRAME_M15, start_dt, end_dt)
+    # ── Find correct symbol name ──
+    symbol = find_symbol(symbol_raw)
+    if not symbol:
+        print(f"❌ Symbol not found: {symbol_raw}")
+        print(f"   Available metals: {[s for s in [s.name for s in mt5.symbols_get()] if 'XAU' in s or 'XAG' in s]}")
+        return None
+    print(f"✅ Symbol resolved: {symbol}")
 
-    if any(d is None for d in [df_d, df_h4, df_h1, df_m15]):
-        print("Failed to load data")
+    # ── Load data ──
+    df_d   = get_hist(symbol, mt5.TIMEFRAME_D1,  period_days + 120)
+    df_h4  = get_hist(symbol, mt5.TIMEFRAME_H4,  period_days + 60)
+    df_h1  = get_hist(symbol, mt5.TIMEFRAME_H1,  period_days + 30)
+    df_m15 = get_hist(symbol, mt5.TIMEFRAME_M15, period_days + 10)
+
+    loaded = {
+        'D1':  len(df_d)  if df_d  is not None else 0,
+        'H4':  len(df_h4) if df_h4 is not None else 0,
+        'H1':  len(df_h1) if df_h1 is not None else 0,
+        'M15': len(df_m15)if df_m15 is not None else 0,
+    }
+    print(f"📊 Data loaded: {loaded}")
+
+    if any(v == 0 for v in loaded.values()):
+        print("❌ Failed to load one or more timeframes.")
         return None
 
-    # Filter test period
-    df_test = df_m15[df_m15.index >= pd.Timestamp(start_dt.replace(tzinfo=None))]
+    # ── Trim to test period ──
+    cutoff  = pd.Timestamp(datetime.now() - timedelta(days=period_days))
+    df_test = df_m15[df_m15.index >= cutoff].copy()
+    print(f"📅 Test bars: {len(df_test)} M15 candles")
 
-    trades   = []
-    balance  = INITIAL_BALANCE
-    equity   = balance
-    peak_eq  = balance
-    max_dd   = 0.0
-    signals  = 0
+    if len(df_test) < 50:
+        print("❌ Not enough test bars.")
+        return None
 
-    # Sliding window backtest
-    window = 200
-    for i in range(window, len(df_test) - 1):
+    # ── Backtest loop ──
+    trades       = []
+    balance      = INITIAL_BALANCE
+    peak_eq      = balance
+    max_dd       = 0.0
+    signals      = 0
+    skipped_bias = 0
+    skipped_sweep= 0
+    skipped_conf = 0
+    window       = 100  # lookback window for each step
+
+    for i in range(window, len(df_test) - 5):
         bar_time = df_test.index[i]
         hour     = bar_time.hour
 
-        # Killzone filter
+        # Killzone check
         in_kz = any(s <= hour < e for s, e in KILLZONES.values())
         if not in_kz:
             continue
 
-        # Build local windows
-        m15_slice = df_test.iloc[max(0, i-window):i+1]
-        h1_idx    = df_h1.index.searchsorted(bar_time)
-        h4_idx    = df_h4.index.searchsorted(bar_time)
-        d_idx     = df_d.index.searchsorted(bar_time)
+        # Build local slices
+        m15_slice = df_test.iloc[max(0, i - window): i + 1].copy()
 
-        if h1_idx < 50 or h4_idx < 30 or d_idx < 20:
+        # Find matching indices in H1/H4/D1
+        h1_mask  = df_h1.index <= bar_time
+        h4_mask  = df_h4.index <= bar_time
+        d_mask   = df_d.index  <= bar_time
+
+        h1_sl = df_h1[h1_mask].iloc[-80:]
+        h4_sl = df_h4[h4_mask].iloc[-60:]
+        d_sl  = df_d[d_mask].iloc[-50:]
+
+        if len(h1_sl) < 10 or len(h4_sl) < 10 or len(d_sl) < 5:
             continue
 
-        h1_sl  = df_h1.iloc[max(0, h1_idx-100):h1_idx]
-        h4_sl  = df_h4.iloc[max(0, h4_idx-60):h4_idx]
-        d_sl   = df_d.iloc[max(0, d_idx-50):d_idx]
-
-        if len(h1_sl) < 10 or len(h4_sl) < 10 or len(d_sl) < 10:
-            continue
-
-        # Bias
+        # ── Layer 1: HTF Bias ──
         bias = smc.get_htf_bias(d_sl, h4_sl, h1_sl)
-        if not bias:
+        if bias is None:
+            skipped_bias += 1
             continue
 
-        # Sweep
-        sweep = smc.detect_liquidity_sweep(h1_sl, lookback=40)
+        # ── Layer 2: Liquidity Sweep (H1) ──
+        sweep = smc.detect_liquidity_sweep(h1_sl, lookback=30)
         if not sweep or sweep != bias:
+            skipped_sweep += 1
             continue
 
-        # FVG + OB
+        direction = sweep
+
+        # ── Layer 3: FVG on M15 ──
         fvgs = smc.detect_fvg(m15_slice)
         active_fvgs = [f for f in fvgs
-                       if f['type'] == bias and not f['mitigated']
-                       and f['index'] >= len(m15_slice) - 10]
+                       if f['type'] == direction
+                       and not f['mitigated']
+                       and f['index'] >= len(m15_slice) - 8]
         best_fvg = active_fvgs[-1] if active_fvgs else None
 
-        obs = smc.detect_order_blocks(m15_slice)
-        recent_obs = [o for o in obs if o['type'] == bias and o['index'] >= len(m15_slice)-20]
+        # ── Layer 4: OB on M15 ──
+        obs = smc.detect_order_blocks(m15_slice, swing_length=8)
+        recent_obs = [o for o in obs
+                      if o['type'] == direction
+                      and o['index'] >= len(m15_slice) - 15]
         best_ob = recent_obs[-1] if recent_obs else None
 
-        # OTE
+        # Need at least FVG or OB
+        if not best_fvg and not best_ob:
+            continue
+
+        # ── Entry / SL / TP ──
         h20 = m15_slice['high'].iloc[-20:].max()
         l20 = m15_slice['low'].iloc[-20:].min()
-        ote = smc.ote_zone(h20, l20, bias)
+        ote = smc.ote_zone(h20, l20, direction)
 
-        entry = best_fvg['mid'] if best_fvg else (best_ob['mid'] if best_ob else ote['entry_ideal'])
+        if best_fvg:
+            entry = best_fvg['mid']
+        elif best_ob:
+            entry = best_ob['mid']
+        else:
+            entry = ote['entry_ideal']
 
         swing_range = h20 - l20
-        sl_buf  = swing_range * SL_BUFFER_PCT
-        sl  = (l20 - sl_buf)  if bias == 'bullish' else (h20 + sl_buf)
-        tp  = (entry + abs(entry-sl)*min_rr) if bias == 'bullish' else (entry - abs(entry-sl)*min_rr)
+        sl_buf = swing_range * SL_BUFFER_PCT
+        sl = (l20 - sl_buf) if direction == 'bullish' else (h20 + sl_buf)
+        tp = (entry + abs(entry - sl) * MIN_RR) if direction == 'bullish' \
+             else (entry - abs(entry - sl) * MIN_RR)
 
-        # Confidence
+        # Validate
+        if abs(entry - sl) == 0:
+            continue
+
+        rr_actual = abs(tp - entry) / abs(entry - sl)
+        if rr_actual < 1.5:
+            continue
+
+        # ── Confidence ──
         confidence, factors = smc.confluence_score(
-            bias, bias, bias, best_fvg, best_ob, m15_slice, h1_sl, h4_sl
+            direction, bias, direction, best_fvg, best_ob, m15_slice, h1_sl, h4_sl
         )
         if confidence < MIN_CONFIDENCE:
+            skipped_conf += 1
             continue
 
         signals += 1
         lots = simulate_lot(balance, entry, sl, risk_pct)
 
-        # Simulate outcome (next N candles)
-        result = 'OPEN'
+        # ── Simulate outcome ──
+        result = 'TIMEOUT'
         pnl    = 0.0
-        for j in range(i+1, min(i+100, len(df_test)-1)):
-            fut_high = df_test['high'].iloc[j]
-            fut_low  = df_test['low'].iloc[j]
-            if bias == 'bullish':
-                if fut_low <= sl:
+        future = df_test.iloc[i + 1: min(i + 150, len(df_test))]
+
+        for _, bar in future.iterrows():
+            if direction == 'bullish':
+                if bar['low'] <= sl:
                     pnl = -(abs(entry - sl) * lots * 100)
                     result = 'LOSS'
                     break
-                if fut_high >= tp:
+                if bar['high'] >= tp:
                     pnl = abs(tp - entry) * lots * 100
                     result = 'WIN'
                     break
             else:
-                if fut_high >= sl:
+                if bar['high'] >= sl:
                     pnl = -(abs(entry - sl) * lots * 100)
                     result = 'LOSS'
                     break
-                if fut_low <= tp:
+                if bar['low'] <= tp:
                     pnl = abs(entry - tp) * lots * 100
                     result = 'WIN'
                     break
 
-        if result == 'OPEN':
-            continue  # Skip incomplete trades
+        if result == 'TIMEOUT':
+            continue
 
         balance += pnl
-        equity   = balance
-        peak_eq  = max(peak_eq, equity)
-        dd       = (peak_eq - equity) / peak_eq * 100
+        peak_eq  = max(peak_eq, balance)
+        dd       = (peak_eq - balance) / peak_eq * 100
         max_dd   = max(max_dd, dd)
 
         trades.append({
-            'time':       bar_time,
-            'direction':  bias,
+            'time':       str(bar_time),
+            'direction':  direction,
             'entry':      round(entry, 5),
             'sl':         round(sl, 5),
             'tp':         round(tp, 5),
@@ -189,62 +241,84 @@ def run_backtest(symbol, period_days=30, risk_pct=2.0, min_rr=MIN_RR):
             'pnl':        round(pnl, 2),
             'balance':    round(balance, 2),
             'confidence': round(confidence, 3),
-            'factors':    '|'.join(factors)
+            'factors':    '|'.join(factors),
         })
 
-    mt5.shutdown()
+    # ── Print Debug Stats ──
+    print(f"\n📊 Signal Analysis:")
+    print(f"   Total M15 bars scanned:  {len(df_test)}")
+    print(f"   Bars in killzone:        ~{len(df_test)//3}")
+    print(f"   Skipped (no bias):       {skipped_bias}")
+    print(f"   Skipped (no sweep):      {skipped_sweep}")
+    print(f"   Skipped (low conf):      {skipped_conf}")
+    print(f"   Signals generated:       {signals}")
+    print(f"   Completed trades:        {len(trades)}")
 
-    # ── Report ──
     if not trades:
-        print("No completed trades in test period.")
+        print("\n⚠️  No trades completed. Conditions may be too strict.")
+        print("   Consider relaxing MIN_CONFIDENCE or SWEEP_LOOKBACK.")
         return None
 
-    df_trades = pd.DataFrame(trades)
-    wins      = df_trades[df_trades['result'] == 'WIN']
-    losses    = df_trades[df_trades['result'] == 'LOSS']
-    total_pnl = df_trades['pnl'].sum()
-    win_rate  = len(wins) / len(df_trades) * 100
-    avg_win   = wins['pnl'].mean() if len(wins) > 0 else 0
-    avg_loss  = losses['pnl'].mean() if len(losses) > 0 else 0
-    profit_factor = abs(wins['pnl'].sum() / losses['pnl'].sum()) if losses['pnl'].sum() != 0 else 999
-    monthly_return = (balance - INITIAL_BALANCE) / INITIAL_BALANCE / period_days * 30 * 100
+    # ── Report ──
+    df_t    = pd.DataFrame(trades)
+    wins    = df_t[df_t['result'] == 'WIN']
+    losses  = df_t[df_t['result'] == 'LOSS']
+    total_pnl  = df_t['pnl'].sum()
+    win_rate   = len(wins) / len(df_t) * 100
+    avg_win    = wins['pnl'].mean()    if len(wins) > 0    else 0
+    avg_loss   = losses['pnl'].mean()  if len(losses) > 0  else 0
+    pf = abs(wins['pnl'].sum() / losses['pnl'].sum()) if losses['pnl'].sum() != 0 else 999
+    monthly    = (balance - INITIAL_BALANCE) / INITIAL_BALANCE / period_days * 30 * 100
 
     print(f"\n{'='*60}")
-    print(f"BACKTEST RESULTS — {symbol} ({period_days}d)")
+    print(f"RESULTS — {symbol} ({period_days}d)")
     print(f"{'='*60}")
-    print(f"Period:         {start_dt.date()} → {end_dt.date()}")
-    print(f"Initial Balance: ${INITIAL_BALANCE:,.2f}")
-    print(f"Final Balance:   ${balance:,.2f}")
-    print(f"Total P&L:       ${total_pnl:+,.2f}")
-    print(f"Monthly Return:  {monthly_return:+.2f}%")
-    print(f"─────────────────────────────────────────")
-    print(f"Total Signals:   {signals}")
-    print(f"Total Trades:    {len(df_trades)}")
-    print(f"Wins:            {len(wins)}  ({win_rate:.1f}%)")
-    print(f"Losses:          {len(losses)}")
-    print(f"Avg Win:         ${avg_win:+.2f}")
-    print(f"Avg Loss:        ${avg_loss:+.2f}")
-    print(f"Profit Factor:   {profit_factor:.2f}")
-    print(f"Max Drawdown:    {max_dd:.2f}%")
+    print(f"Initial Balance:  ${INITIAL_BALANCE:,.2f}")
+    print(f"Final Balance:    ${balance:,.2f}")
+    print(f"Total P&L:        ${total_pnl:+,.2f}")
+    print(f"Monthly Return:   {monthly:+.1f}%")
+    print(f"─────────────────────────────")
+    print(f"Total Trades:     {len(df_t)}")
+    print(f"Wins:             {len(wins)}  ({win_rate:.1f}%)")
+    print(f"Losses:           {len(losses)}")
+    print(f"Avg Win:          ${avg_win:+.2f}")
+    print(f"Avg Loss:         ${avg_loss:+.2f}")
+    print(f"Profit Factor:    {pf:.2f}")
+    print(f"Max Drawdown:     {max_dd:.2f}%")
     print(f"{'='*60}")
 
     # Save CSV
-    out = os.path.join(os.path.dirname(__file__), f"backtest_{symbol}_{period_days}d.csv")
-    df_trades.to_csv(out, index=False)
+    out = os.path.join(os.path.dirname(__file__), f"result_{symbol}_{period_days}d.csv")
+    df_t.to_csv(out, index=False)
     print(f"Saved: {out}")
-
-    return {
-        'symbol': symbol, 'period': period_days,
-        'initial': INITIAL_BALANCE, 'final': balance,
-        'pnl': total_pnl, 'monthly_return': monthly_return,
-        'trades': len(df_trades), 'win_rate': win_rate,
-        'profit_factor': profit_factor, 'max_dd': max_dd,
-        'trades_df': df_trades
-    }
+    return {'symbol': symbol, 'period': period_days, 'pnl': total_pnl,
+            'win_rate': win_rate, 'max_dd': max_dd, 'monthly': monthly,
+            'trades': len(df_t), 'pf': pf}
 
 
 if __name__ == "__main__":
-    # Run 30-day and 90-day backtests
+    if not mt5.initialize():
+        print("MT5 init failed!")
+        sys.exit(1)
+
+    print("MT5 Connected ✅")
+    print(f"Account: {mt5.account_info().login}")
+
+    results = []
     for sym in ["XAUUSD.s", "XAGUSD.s"]:
         for days in [30, 90]:
-            run_backtest(sym, period_days=days)
+            r = run_backtest(sym, period_days=days, risk_pct=RISK_PER_TRADE_PCT)
+            if r:
+                results.append(r)
+
+    mt5.shutdown()
+
+    if results:
+        print(f"\n{'='*60}")
+        print("SUMMARY")
+        print(f"{'='*60}")
+        for r in results:
+            print(f"{r['symbol']:12} {r['period']:3}d | "
+                  f"Trades:{r['trades']:3} | WR:{r['win_rate']:.1f}% | "
+                  f"PF:{r['pf']:.2f} | DD:{r['max_dd']:.1f}% | "
+                  f"Monthly:{r['monthly']:+.1f}%")
