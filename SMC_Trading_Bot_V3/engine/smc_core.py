@@ -210,11 +210,12 @@ class SMCCore:
         curr_close = last['close']
         curr_open  = last['open']
 
-        # Bullish sweep: wick below prior lows, close above → trapped shorts
-        if curr_low < prev_ll and curr_close > prev_ll and curr_close > curr_open:
+        # Bullish sweep: wick below prior lows + close rejection above LL
+        # (removed candle color requirement — just need rejection)
+        if curr_low < prev_ll and curr_close > prev_ll:
             return 'bullish'
-        # Bearish sweep: wick above prior highs, close below → trapped longs
-        if curr_high > prev_hh and curr_close < prev_hh and curr_close < curr_open:
+        # Bearish sweep: wick above prior highs + close rejection below HH
+        if curr_high > prev_hh and curr_close < prev_hh:
             return 'bearish'
         return None
 
@@ -298,10 +299,10 @@ class SMCCore:
             else:
                 scores['bearish'] += 1
 
-            # Need at least 4/6 score to confirm bias
-            if scores['bullish'] >= 4:
+            # Need at least 3/6 score to confirm bias (relaxed for more signals)
+            if scores['bullish'] >= 3 and scores['bullish'] > scores['bearish']:
                 return 'bullish'
-            if scores['bearish'] >= 4:
+            if scores['bearish'] >= 3 and scores['bearish'] > scores['bullish']:
                 return 'bearish'
             return None  # Conflicted, no trade
 

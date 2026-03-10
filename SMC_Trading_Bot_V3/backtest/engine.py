@@ -197,28 +197,44 @@ def run_backtest(symbol_raw, period_days=30, risk_pct=2.0):
         signals += 1
         lots = simulate_lot(balance, entry, sl, risk_pct)
 
-        # ── Simulate outcome ──
-        result = 'TIMEOUT'
-        pnl    = 0.0
-        future = df_test.iloc[i + 1: min(i + 150, len(df_test))]
+        # ── Simulate outcome (limit order: wait for fill first) ──
+        result    = 'TIMEOUT'
+        pnl       = 0.0
+        filled    = False
+        future    = df_test.iloc[i + 1: min(i + 300, len(df_test))]
 
         for _, bar in future.iterrows():
+            # Step 1: Check if limit order fills
+            if not filled:
+                if direction == 'bullish' and bar['low'] <= entry <= bar['high']:
+                    filled = True
+                elif direction == 'bearish' and bar['low'] <= entry <= bar['high']:
+                    filled = True
+                # Also fill if price gaps through entry
+                elif direction == 'bullish' and bar['high'] < entry:
+                    filled = True  # price came down past entry
+                elif direction == 'bearish' and bar['low'] > entry:
+                    filled = True  # price went up past entry
+                if not filled:
+                    continue
+
+            # Step 2: Check SL/TP after fill
             if direction == 'bullish':
                 if bar['low'] <= sl:
-                    pnl = -(abs(entry - sl) * lots * 100)
+                    pnl    = -(abs(entry - sl) * lots * 100)
                     result = 'LOSS'
                     break
                 if bar['high'] >= tp:
-                    pnl = abs(tp - entry) * lots * 100
+                    pnl    = abs(tp - entry) * lots * 100
                     result = 'WIN'
                     break
             else:
                 if bar['high'] >= sl:
-                    pnl = -(abs(entry - sl) * lots * 100)
+                    pnl    = -(abs(entry - sl) * lots * 100)
                     result = 'LOSS'
                     break
                 if bar['low'] <= tp:
-                    pnl = abs(entry - tp) * lots * 100
+                    pnl    = abs(entry - tp) * lots * 100
                     result = 'WIN'
                     break
 
