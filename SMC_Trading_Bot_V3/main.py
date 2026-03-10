@@ -1,12 +1,11 @@
 # ============================================================
-# SMC Phantom V3.0 - Main Execution Engine
-# Smart Money Concepts Automated Trading System
+# SMC Phantom V3.1 - Main Execution Engine (Hybrid Mode)
+# Smart Money Concepts + ICT Silver Bullet
 #
 # Architecture:
-#   Daily + H4 + H1 → Bias Filter
-#   H1 Liquidity Sweep → Signal Trigger
-#   M15 FVG + Order Block + OTE → Entry Precision
-#   Dynamic Risk + Trailing Stop → Money Management
+#   SWING:  Daily + H4 + H1 Bias → H1 Sweep → M15 FVG+OB+OTE
+#   SCALP:  Silver Bullet Windows → M5 Sweep → M1 FVG Entry
+#   RISK:   Swing 2% | Scalp 1% | Daily limit 5%
 # ============================================================
 
 import time
@@ -16,6 +15,7 @@ from datetime import datetime, timezone
 
 from config import *
 from engine.smc_core import SMCCore
+from strategies.silver_bullet import run_silver_bullet, in_silver_bullet_window
 from risk.position_sizing import (
     calculate_lot_size, check_daily_drawdown,
     check_weekly_drawdown, already_in_trade, total_open_trades
@@ -36,6 +36,7 @@ weekly_start_balance = None
 last_day  = None
 last_week = None
 last_daily_report_hour = -1
+daily_scalp_count    = 0       # Silver Bullet trades today
 
 
 # ─────────────────────────────────────────────────────────
@@ -313,8 +314,9 @@ def main():
             if now.day != last_day:
                 daily_start_balance = mt5.account_info().balance
                 last_daily_report_hour = -1
+                daily_scalp_count = 0
                 last_day = now.day
-                log("Daily balance reset")
+                log("Daily balance reset + scalp counter reset")
 
             if now.isocalendar()[1] != last_week:
                 weekly_start_balance = mt5.account_info().balance
@@ -346,7 +348,19 @@ def main():
 
             log(f"🕐 Active session: {session}")
 
-            # ── Analyze All Pairs ──
+            # ── Silver Bullet Scalp (优先执行) ──
+            sb_window = in_silver_bullet_window()
+            if sb_window:
+                log(f"⚡ Silver Bullet Window: {sb_window}")
+                for symbol in PRIMARY_PAIRS:  # 超短线只做黄金+白银
+                    try:
+                        placed = run_silver_bullet(symbol, sb_window, daily_scalp_count)
+                        if placed:
+                            daily_scalp_count += 1
+                    except Exception as e:
+                        log(f"[SB][{symbol}] Error: {e}", "ERROR")
+
+            # ── Swing 波段分析 ──
             for symbol in TARGET_PAIRS:
                 try:
                     analyze_symbol(symbol, session)
